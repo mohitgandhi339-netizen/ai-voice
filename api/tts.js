@@ -2,7 +2,7 @@ export default async function handler(req, res) {
   try {
     const { text } = req.body;
 
-    const voiceId = "o6qTxWUeRyzRYZyUNDVJ"; // example voice
+    const voiceId = "o6qTxWUeRyzRYZyUNDVJ";
     const apiKey = process.env.ELEVENLABS_API_KEY;
 
     const response = await fetch(
@@ -21,15 +21,18 @@ export default async function handler(req, res) {
     );
 
     if (!response.ok) {
-      return res.status(500).json({ error: "ElevenLabs failed" });
+      const err = await response.text();
+      console.error("ElevenLabs Error:", err);
+      return res.status(500).json({ error: err });
     }
 
     const audioBuffer = await response.arrayBuffer();
 
     res.setHeader("Content-Type", "audio/mpeg");
-    res.send(Buffer.from(audioBuffer));
+    res.status(200).send(Buffer.from(audioBuffer));
+
   } catch (error) {
-    console.error(error);
+    console.error("Server Error:", error);
     res.status(500).json({ error: "Server error" });
   }
 }

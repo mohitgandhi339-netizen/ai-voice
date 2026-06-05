@@ -2,7 +2,7 @@ export default async function handler(req, res) {
   try {
     const { text } = req.body;
 
-    const voiceId = "21m00Tcm4TlvDq8ikWAM"; // example voice
+    const voiceId = "o6qTxWUeRyzRYZyUNDVJ"; // example voice
     const apiKey = process.env.ELEVENLABS_API_KEY;
 
     const response = await fetch(

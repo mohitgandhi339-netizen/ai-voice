@@ -551,7 +551,7 @@
     processInput(text);
   }
 
-  function processInput(text) {
+  async function processInput(text) {
     setStateLabel('thinking');
     // Small simulated "thinking" delay for realism
     const delay = 600 + Math.random() * 500;

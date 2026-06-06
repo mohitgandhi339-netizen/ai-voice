@@ -564,8 +564,7 @@
         /\b(kya|hai|hain|aap|main|mujhe|karo|kaise|bata|chahiye|nahi|mera|tumhara|dijiye|bataiye|chahte|chahti)\b/i.test(text);
       if (hasHindi) { lang = 'hi'; updateLangToggle(); }
 
-      const response = getResponse(text, lang);
-
+     const response = await askAI(text);
       if (response === null || leadPending) {
         // Show lead form
         if (!leadPending) {

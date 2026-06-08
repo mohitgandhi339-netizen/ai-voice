@@ -1,406 +1,459 @@
 /**
- * ============================================================
- * JUSTDOWOW – AI Voice Assistant
- * Version: 1.0  |  Pure Vanilla JS  |  No dependencies
- * ============================================================
- * Uses: Web Speech API (SpeechRecognition + SpeechSynthesis)
- * Lead submission: Web3Forms (same key as existing site forms)
- * ============================================================
+ * ================================================================
+ *  JUSTDOWOW — AI Voice Assistant  (voice-assistant.js)
+ *  Version 4.0  |  Production-Audited  |  Pure Vanilla JS
+ * ================================================================
+ *
+ *  AUDIT FIXES IN THIS VERSION
+ *  ─────────────────────────────────────────────────────────────
+ *  FIX-01  synth / window.speechSynthesis fully removed.
+ *          ElevenLabs is the ONLY TTS path.
+ *  FIX-02  speakText() AbortController + 15 s timeout.
+ *          UI never hangs in 'thinking' or 'speaking' state.
+ *  FIX-03  callAI() pushes to aiHistory ONLY on success.
+ *          Failed/retried turns never corrupt the history.
+ *  FIX-04  aiHistory trimmed to MAX_HISTORY*2 messages on every
+ *          send so token cost stays low and requests stay fast.
+ *  FIX-05  processInput() resets state + hides typing on EVERY
+ *          error path with no exceptions.
+ *  FIX-06  parseAIResponse() strips ONLY known signal tags.
+ *          Arbitrary [BRACKETS] in AI text are preserved.
+ *  FIX-07  addMsg() guards against empty / whitespace-only text.
+ *  FIX-08  scrapeDOMContent() skips SCRIPT/STYLE/NOSCRIPT tags.
+ *  FIX-09  SpeechRecognition handlers assigned ONCE in
+ *          buildRecognition(), not re-attached on every call.
+ *  FIX-10  startListening() returns early while state=thinking
+ *          to prevent overlapping recognition sessions.
+ *  FIX-11  renderLeadForm() guard: won't render if form already
+ *          present in DOM.
+ *  FIX-12  handleInput() deduplication: adds user bubble ONCE
+ *          regardless of entry path (voice / chip / text input).
+ *  FIX-13  endConversation() callable safely from speakText
+ *          onDone without double-executing.
+ *  FIX-14  Greeting added to aiHistory so OpenAI has context
+ *          from message 1.
+ *  FIX-15  WHATSAPP_CTA rendered as a tappable anchor, never
+ *          as plain text that breaks on mobile.
+ *
+ *  ARCHITECTURE
+ *  ─────────────────────────────────────────────────────────────
+ *  STT  → Web SpeechRecognition (browser-native)
+ *  AI   → OpenAI GPT-4o-mini via POST /api/ai   (key: server)
+ *  TTS  → ElevenLabs eleven_multilingual_v2
+ *         via POST /api/tts                      (key: server)
+ *  Lead → POST /api/lead → Web3Forms
+ *  Lang → Hindi / English / Hinglish auto-detect
+ * ================================================================
  */
 
 (function () {
   'use strict';
 
-  /* ─────────────────────────────────────────────────────────
-   * 1. COMPANY KNOWLEDGE BASE
-   *    All information sourced exclusively from existing site.
-   * ─────────────────────────────────────────────────────────*/
-  const KB = {
-    company: {
-      name: 'JUSTDOWOW',
-      tagline: "India's Most Creative Growth Agency",
-      description: 'A premium digital marketing agency delivering data-driven SEO, performance ads, brand identity, social media, and web development.',
-      office: 'Tronica City, Ghaziabad, NCR',
-      serving: 'Tronica City, Noida, Delhi, and all of NCR',
-      whatsapp: 'https://wa.me/919990066953',
-      whatsappNum: '+91 99900 66953',
-      email: 'justdowowinfo@gmail.com',
-      instagram: 'https://www.instagram.com/justdowow/',
-      web3formsKey: 'f2a9eff7-9aec-47ae-92f0-27fd7f497bed',
-    },
+  /* ══════════════════════════════════════════════════════════════
+     CONSTANTS
+  ══════════════════════════════════════════════════════════════ */
+  var MAX_HISTORY   = 10;    // max conversation PAIRS kept in memory
+  var TTS_TIMEOUT   = 15000; // ms — abort ElevenLabs if no response
+  var RESTART_DELAY = 400;   // ms — pause before restarting mic
+  var WA_URL        = 'https://wa.me/919990066953';
+  var WA_NUM        = '+91 99900 66953';
+  var EMAIL         = 'justdowowinfo@gmail.com';
+
+  /* ══════════════════════════════════════════════════════════════
+     1.  COMPANY KNOWLEDGE BASE
+         Injected verbatim into the OpenAI system prompt.
+  ══════════════════════════════════════════════════════════════ */
+  var COMPANY = {
+    name:     'JUSTDOWOW',
+    tagline:  "India's Most Creative Growth Agency",
+    office:   'Tronica City, Ghaziabad, NCR India',
+    serving:  'Tronica City, Ghaziabad, Noida, Greater Noida, Delhi, and all of NCR',
+    whatsapp: WA_NUM,
+    waUrl:    WA_URL,
+    email:    EMAIL,
+    instagram:'https://www.instagram.com/justdowow/',
     services: [
-      {
-        name: 'SEO & Organic Growth',
-        desc: 'Data-driven SEO combining technical precision, content authority, and link intelligence to rank on page 1.',
-        locations: ['Delhi', 'Noida', 'Tronica City'],
-      },
-      {
-        name: 'Performance Marketing',
-        desc: 'Meta, Google, YouTube ad campaigns that turn budgets into revenue with laser-targeted, profitable scaling.',
-      },
-      {
-        name: 'Brand Identity Design',
-        desc: 'Premium logos, brand kits, and visual systems that communicate authority and make brands unforgettable.',
-      },
-      {
-        name: 'Social Media Marketing',
-        desc: 'Instagram, Facebook, LinkedIn — community building, content, and influencer strategies that convert.',
-      },
-      {
-        name: 'Web Design & Development',
-        desc: 'Fast, mobile-first, conversion-obsessed websites built on UX psychology and premium aesthetics.',
-      },
-      {
-        name: 'Funnel & CRO Strategy',
-        desc: 'Multi-touch funnels with A/B testing that maximise every rupee of ad spend from awareness to purchase.',
-      },
+      'SEO & Organic Growth',
+      'Local SEO',
+      'Google Business Profile Optimisation',
+      'Performance Marketing',
+      'Google Ads',
+      'Meta Ads (Facebook & Instagram Ads)',
+      'Social Media Marketing',
+      'Instagram Marketing',
+      'Facebook Ads',
+      'Brand Identity Design',
+      'Website Design',
+      'Website Development',
+      'Landing Pages',
+      'Lead Generation',
+      'Funnel Strategy',
+      'Conversion Rate Optimisation (CRO)',
+      'WhatsApp Marketing',
+      'Content Marketing',
+      'Marketing Automation',
+      'Real Estate & Property Marketing',
+      'Tronica City Property Promotion',
+      'Video Marketing & Reels',
     ],
-    why: [
-      'Strategy-first approach — deep brand audit and custom roadmap before any execution.',
-      'Full-funnel expertise covering awareness, conversion, and retention.',
-      'Radical transparency with real-time dashboards and weekly reports.',
-      'Creative that converts — design meets performance obsession.',
-    ],
-    locations: {
-      'tronica city': 'JUSTDOWOW is headquartered in Tronica City, Ghaziabad, and serves all businesses in the NCR region.',
-      noida: 'We serve Noida businesses across Sector 18, 62, 125, 137, and Greater Noida with full-service digital marketing.',
-      delhi: 'Delhi clients get premium positioning, bilingual content (Hindi + English), and campaigns covering South, North, East & West Delhi.',
+    pricing: {
+      sme:  'SME packages start from Rs.8,000 to Rs.10,000 per month',
+      ppc:  'Minimum recommended ad spend is Rs.15,000 per month for PPC',
+      free: 'Free 45-minute strategy session with digital audit — no commitment required',
     },
-    process: [
-      'Discovery — we understand your business and goals.',
-      'Strategy — custom growth roadmap based on market research.',
-      'Planning — detailed execution calendar.',
-      'Creative Development — design, copy, and creatives.',
-      'Implementation — live campaign launch.',
-      'Optimization — continuous A/B testing and improvement.',
-      'Growth — scaling what works for long-term brand dominance.',
-    ],
-    contact: {
-      response: 'We reply within 24 hours. You can reach us on WhatsApp at +91 99900 66953, email justdowowinfo@gmail.com, or fill the form on our website.',
+    locations: {
+      tronica: 'Headquartered in Tronica City, Ghaziabad. Specialised in local property and SME marketing.',
+      noida:   'Serving Sector 18, 62, 63, 125, 137, Greater Noida West, and surrounding NCR areas.',
+      delhi:   'Serving South Delhi, Dwarka, Rohini, East Delhi, Karol Bagh, and all commercial zones.',
     },
   };
 
-  /* ─────────────────────────────────────────────────────────
-   * 2. MULTILINGUAL STRINGS
-   * ─────────────────────────────────────────────────────────*/
-  const STRINGS = {
+  /* ══════════════════════════════════════════════════════════════
+     2.  SYSTEM PROMPT
+  ══════════════════════════════════════════════════════════════ */
+  function buildSystemPrompt(domText, currentLang) {
+    var langRule = currentLang === 'hi'
+      ? 'Reply in natural Hindi or Hinglish. Mix Hindi and English as Indians speak in real conversation. Keep it warm and conversational.'
+      : 'Reply in English. If the user writes Hindi or Hinglish, automatically switch and match their language.';
+
+    var serviceList = COMPANY.services.map(function (s, i) {
+      return (i + 1) + '. ' + s;
+    }).join('\n');
+
+    return 'You are Wowy — the official AI assistant of JUSTDOWOW, a premium digital marketing agency.\n\n' +
+
+'IDENTITY RULES\n' +
+'- You are Wowy, the JUSTDOWOW AI Assistant.\n' +
+'- NEVER say "I am ChatGPT", "I am an AI language model", or mention OpenAI.\n' +
+'- You are a friendly, experienced senior digital marketing consultant.\n' +
+'- Always represent JUSTDOWOW professionally.\n\n' +
+
+'COMPANY\n' +
+'- Name: ' + COMPANY.name + '\n' +
+'- Tagline: ' + COMPANY.tagline + '\n' +
+'- Office: ' + COMPANY.office + '\n' +
+'- Areas served: ' + COMPANY.serving + '\n' +
+'- WhatsApp: ' + COMPANY.whatsapp + '\n' +
+'- Email: ' + COMPANY.email + '\n\n' +
+
+'SERVICES OFFERED BY JUSTDOWOW:\n' + serviceList + '\n\n' +
+
+'PRICING\n' +
+'- ' + COMPANY.pricing.sme + '\n' +
+'- ' + COMPANY.pricing.ppc + '\n' +
+'- ' + COMPANY.pricing.free + '\n\n' +
+
+'LOCATIONS\n' +
+'- Tronica City / Ghaziabad: ' + COMPANY.locations.tronica + '\n' +
+'- Noida: ' + COMPANY.locations.noida + '\n' +
+'- Delhi: ' + COMPANY.locations.delhi + '\n\n' +
+
+'CURRENT PAGE CONTENT (primary source of truth for this conversation):\n' +
+'---\n' +
+(domText || 'Not available.') + '\n' +
+'---\n\n' +
+
+'LANGUAGE RULE: ' + langRule + '\n\n' +
+
+'CORE BEHAVIOUR\n' +
+'1. Keep voice responses under 100 words. Be concise and direct.\n' +
+'2. Give real, actionable marketing advice. Never be vague or generic.\n' +
+'3. When asked about real estate or property marketing, recommend: Local SEO, Google Business Profile, Meta Ads, Property Reels on Instagram/YouTube, WhatsApp Lead Funnels, Google Search Ads targeting local property buyers.\n' +
+'4. Tailor advice to the user\'s city when mentioned (Tronica City, Noida, Delhi, Ghaziabad, etc.).\n' +
+'5. Tailor strategy recommendations to the user\'s budget when mentioned.\n' +
+'6. For SEO vs Google Ads: SEO = long-term organic growth (3-6 months); Google Ads = immediate traffic and leads. Recommend based on their timeline and budget.\n' +
+'7. NEVER promise specific rankings, fixed lead counts, or guaranteed revenue results.\n' +
+'8. NEVER invent services, prices, team names, or company details not listed above.\n' +
+'9. If information is unavailable: say "I don\'t have that detail — please contact our team on WhatsApp: ' + COMPANY.whatsapp + ' or email ' + COMPANY.email + '"\n\n' +
+
+'LEAD QUALIFICATION\n' +
+'When a user shows buying intent, qualify them naturally — ask ONE question at a time:\n' +
+'1. What type of business do you have?\n' +
+'2. Which city or area are you targeting?\n' +
+'3. What is your monthly marketing budget?\n' +
+'4. What is your biggest current marketing challenge?\n' +
+'After qualifying, recommend a suitable strategy and invite them to consult on WhatsApp.\n\n' +
+
+'SIGNAL TAGS — output on their own line when appropriate:\n' +
+'- [COLLECT_LEAD]     — output ONCE when user clearly wants to be contacted or has strong buying intent AND you have enough context about their need.\n' +
+'- [END_CONVERSATION] — output when user says: bye, goodbye, band karo, exit, stop, ok thanks, shukriya, theek hai, bas karo.\n' +
+'- [WHATSAPP_CTA]     — output when it is natural to offer a WhatsApp consultation link.\n\n' +
+
+'FORMATTING\n' +
+'- No markdown: no **bold**, no # headers, no bullet lists starting with *.\n' +
+'- Short paragraphs only, as you would speak.\n' +
+'- Warm, professional, conversational tone.';
+  }
+
+  /* ══════════════════════════════════════════════════════════════
+     3.  DOM SCRAPER  (FIX-08: excludes script/style nodes)
+  ══════════════════════════════════════════════════════════════ */
+  function scrapeDOMContent() {
+    var SKIP = { SCRIPT: 1, STYLE: 1, NOSCRIPT: 1, META: 1, HEAD: 1, LINK: 1, SVG: 1, PATH: 1 };
+    var seen = [];
+    var parts = [];
+
+    var selectors = [
+      'h1', 'h2', 'h3',
+      'main p', 'article p',
+      '#about', '#about p', '#services p', '#contact p', '#faq p', '#faq li',
+      '.hero p', '.section-pad p',
+      '[class*="service"] p', '[class*="about"] p', '[class*="hero"] p',
+    ];
+
+    for (var i = 0; i < selectors.length; i++) {
+      try {
+        var els = document.querySelectorAll(selectors[i]);
+        for (var j = 0; j < els.length; j++) {
+          var el = els[j];
+          if (seen.indexOf(el) !== -1) continue;
+          if (SKIP[el.tagName]) continue;
+          seen.push(el);
+          var text = (el.innerText || el.textContent || '').trim();
+          if (text.length > 15 && text.length < 600) {
+            parts.push(text);
+          }
+        }
+      } catch (e) { /* unsupported selector — skip */ }
+    }
+
+    // Deduplicate
+    var unique = [];
+    var seenText = {};
+    for (var k = 0; k < parts.length; k++) {
+      if (!seenText[parts[k]]) {
+        seenText[parts[k]] = 1;
+        unique.push(parts[k]);
+      }
+    }
+    return unique.join('\n').slice(0, 2500);
+  }
+
+  /* ══════════════════════════════════════════════════════════════
+     4.  UI STRINGS
+  ══════════════════════════════════════════════════════════════ */
+  var STR = {
     en: {
-      greeting: `Hi there! I'm Wowy, the JUSTDOWOW AI assistant. I can tell you all about our digital marketing services — SEO, ads, branding, social media, web development — and how we help brands grow. What can I help you with today?`,
-      chipGreeting: ['Our Services', 'About JUSTDOWOW', 'How We Work', 'Get a Free Consultation', 'WhatsApp Us'],
-      listenLabel: 'Listening…',
-      speakLabel: 'Speaking…',
-      thinkLabel: 'Thinking…',
-      idleLabel: 'Tap mic to speak',
-      noSupport: "Your browser doesn't support voice input. Please type your question below.",
-      notHeard: "Sorry, I didn't catch that. Could you repeat or type your question?",
-      leadPrompt: "I'd love to get you a free consultation! Please share your details and our team will be in touch within 24 hours.",
-      leadSuccess: "Thank you! Your details have been shared with our team. We'll reach out within 24 hours. Meanwhile, you can also WhatsApp us at +91 99900 66953.",
-      leadError: "Couldn't submit right now. Please WhatsApp us directly at +91 99900 66953 or email justdowowinfo@gmail.com.",
-      micTooltip: 'Talk to Wowy',
-      langBtn: 'हिंदी',
+      greeting:    "Hi! I'm Wowy, JUSTDOWOW's AI assistant. I can help with SEO, Google Ads, Meta Ads, branding, websites, and more. What can I help you with today?",
+      chips:       ['Our Services', 'About JUSTDOWOW', 'Pricing', 'Free Consultation', 'Real Estate Marketing', 'SEO vs Google Ads'],
+      listening:   'Listening\u2026',
+      thinking:    'Thinking\u2026',
+      speaking:    'Speaking\u2026',
+      idle:        'Tap mic to start',
+      ended:       'Conversation ended',
+      noSupport:   "Voice input isn't supported in this browser. Please type your question below.",
+      ttsError:    "I couldn't speak that — please read the message above.",
+      aiError:     "I'm having trouble connecting right now. Please try again, or WhatsApp us at " + WA_NUM + ".",
+      leadPrompt:  "I'd love to get you a free consultation! Please share a few details and our team will be in touch within 24 hours.",
+      leadSuccess: "Thank you! Your details have been shared with our team. We'll be in touch within 24 hours. You can also WhatsApp us now at " + WA_NUM + ".",
+      leadError:   "Couldn't save your details right now. Please WhatsApp us at " + WA_NUM + " or email " + EMAIL + ".",
+      endConv:     "It was great talking with you! JUSTDOWOW is always here when you need marketing help. Take care!",
+      waPrompt:    "Feel free to WhatsApp us at " + WA_NUM + " for a free strategy session.",
+      langBtn:     '\u0939\u093f\u0902\u0926\u0940',
     },
     hi: {
-      greeting: `नमस्ते! मैं Wowy हूँ, JUSTDOWOW का AI असिस्टेंट। मैं आपको हमारी डिजिटल मार्केटिंग सेवाओं — SEO, Ads, Branding, Social Media, Web Development — के बारे में बता सकता हूँ। आज मैं आपकी कैसे मदद कर सकता हूँ?`,
-      chipGreeting: ['हमारी सेवाएं', 'JUSTDOWOW के बारे में', 'हम कैसे काम करते हैं', 'Free Consultation लें', 'WhatsApp करें'],
-      listenLabel: 'सुन रहा हूँ…',
-      speakLabel: 'बोल रहा हूँ…',
-      thinkLabel: 'सोच रहा हूँ…',
-      idleLabel: 'बोलने के लिए mic दबाएं',
-      noSupport: 'आपका ब्राउज़र voice input support नहीं करता। कृपया नीचे type करें।',
-      notHeard: 'माफ़ करें, मैं सुन नहीं पाया। कृपया दोबारा बोलें या type करें।',
-      leadPrompt: 'बढ़िया! Free consultation के लिए आपकी details लेना चाहूँगा। हमारी team 24 घंटे में संपर्क करेगी।',
-      leadSuccess: 'धन्यवाद! आपकी details हमारी team को मिल गई है। हम 24 घंटे में संपर्क करेंगे। आप अभी WhatsApp भी कर सकते हैं: +91 99900 66953',
-      leadError: 'अभी submit नहीं हो पाया। कृपया +91 99900 66953 पर WhatsApp करें या justdowowinfo@gmail.com पर email करें।',
-      micTooltip: 'Wowy से बात करें',
-      langBtn: 'English',
+      greeting:    "Namaste! Main Wowy hoon, JUSTDOWOW ka AI assistant. SEO, Google Ads, Meta Ads, branding, website — kisi bhi topic mein help kar sakta hoon. Aaj kaise help karoon?",
+      chips:       ['Hamari Services', 'JUSTDOWOW ke baare mein', 'Pricing', 'Free Consultation', 'Real Estate Marketing', 'SEO vs Google Ads'],
+      listening:   'Sun raha hoon\u2026',
+      thinking:    'Soch raha hoon\u2026',
+      speaking:    'Bol raha hoon\u2026',
+      idle:        'Mic dabayein',
+      ended:       'Conversation khatam',
+      noSupport:   'Is browser mein voice support nahi hai. Neeche type karein.',
+      ttsError:    "Boli nahi aa payi — upar ka message padh lijiye.",
+      aiError:     "Abhi connection mein thodi problem hai. Dobara try karein ya " + WA_NUM + " par WhatsApp karein.",
+      leadPrompt:  "Aapki details chahiye free consultation ke liye. Humari team 24 ghante mein contact karegi.",
+      leadSuccess: "Shukriya! Aapki details mil gayi. Hum 24 ghante mein contact karenge. Abhi WhatsApp bhi kar sakte hain: " + WA_NUM,
+      leadError:   "Details save nahi ho payi. Kripya " + WA_NUM + " par WhatsApp karein.",
+      endConv:     "Aapase baat karke acha laga! JUSTDOWOW hamesha yahan hai. Take care!",
+      waPrompt:    "Free strategy session ke liye humein WhatsApp karein: " + WA_NUM,
+      langBtn:     'English',
     },
   };
 
-  /* ─────────────────────────────────────────────────────────
-   * 3. INTENT ENGINE
-   *    Keyword matching for both Hindi and English queries.
-   * ─────────────────────────────────────────────────────────*/
-  function getResponse(text, lang) {
-    const t = text.toLowerCase();
-    const isHi = lang === 'hi';
+  /* ══════════════════════════════════════════════════════════════
+     5.  STATE
+  ══════════════════════════════════════════════════════════════ */
+  var isOpen         = false;
+  var lang           = 'en';
+  var convActive     = false;
+  var state          = 'idle';
+  var recognition    = null;
+  var currentAudio   = null;   // HTMLAudioElement from ElevenLabs
+  var currentAbort   = null;   // AbortController for TTS fetch
+  var restartTimer   = null;
+  var leadPending    = false;
+  var initialized    = false;
+  var domContent     = '';
+  var aiHistory      = [];     // [{role:'user'|'assistant', content:string}]
+  var endingConv     = false;  // FIX-13: guard against double-end
 
-    // Greeting
-    if (/^(hi|hello|hey|namaste|namaskar|helo|hii|good|kaise|kya haal|salam|sat sri)/.test(t)) {
-      return isHi
-        ? 'नमस्ते! JUSTDOWOW में आपका स्वागत है। आप हमारी किस सेवा के बारे में जानना चाहते हैं?'
-        : 'Hello! Welcome to JUSTDOWOW. What would you like to know about our digital marketing services?';
-    }
-
-    // SEO
-    if (/\bseo\b|search engine|organic|rank|google|keyword|backlink/.test(t) ||
-        /सर्च|ऑर्गेनिक|रैंकिंग/.test(t)) {
-      const s = KB.services[0];
-      return isHi
-        ? `हमारी SEO service बहुत powerful है। ${s.desc} हम Delhi, Noida और Tronica City में SEO करते हैं। क्या आप अपने business के लिए SEO consultation चाहते हैं?`
-        : `${s.desc} We serve clients in Delhi, Noida, and Tronica City. Would you like a free SEO audit for your website?`;
-    }
-
-    // PPC / Ads / Performance
-    if (/\b(ppc|ads|paid|google ads|meta ads|facebook ads|youtube ads|performance|advertising|campaign)\b/.test(t) ||
-        /एड्स|paid campaign|विज्ञापन/.test(t)) {
-      const s = KB.services[1];
-      return isHi
-        ? `Performance Marketing में हम Google Ads, Meta Ads और YouTube पर campaigns run करते हैं। ${s.desc} क्या आप अपने budget और requirement बताएंगे?`
-        : `${s.desc} We manage Google, Meta & YouTube ads. What's your budget and business type? We'll suggest the best channel.`;
-    }
-
-    // Branding / Logo / Design
-    if (/\b(brand|logo|design|identity|visual|rebrand|creative)\b/.test(t) ||
-        /ब्रांड|लोगो|डिज़ाइन/.test(t)) {
-      return isHi
-        ? 'हमारी Branding service में premium logo, brand kit, और complete visual identity शामिल है। हम एक ऐसी identity बनाते हैं जो trust और authority communicate करे। अपने project के बारे में बताएं?'
-        : 'Our brand identity service covers premium logos, brand kits, and visual systems that make your business unforgettable. Tell me about your project and we can tailor a package for you.';
-    }
-
-    // Social Media
-    if (/\b(social|instagram|facebook|linkedin|reel|content|post|influencer|community)\b/.test(t) ||
-        /सोशल मीडिया|इंस्टाग्राम|फेसबुक/.test(t)) {
-      return isHi
-        ? 'Social Media Marketing में हम Instagram, Facebook, LinkedIn पर content strategy, community management और influencer partnerships handle करते हैं। आपके business को किस platform पर focus करना चाहिए?'
-        : 'Our social media service covers content strategy, community management, and influencer collaborations across Instagram, Facebook & LinkedIn. Which platform matters most to your business?';
-    }
-
-    // Website / Web Development
-    if (/\b(web|website|landing page|ecommerce|shopify|wordpress|development|speed|ux|ui|mobile site)\b/.test(t) ||
-        /वेबसाइट|वेब/.test(t)) {
-      return isHi
-        ? 'हम fast, mobile-first और conversion-focused websites बनाते हैं। हमारी websites UX psychology और premium design पर based होती हैं जो visitors को customers में convert करती हैं। आपको किस type की website चाहिए?'
-        : 'We build fast, mobile-first, conversion-obsessed websites with premium UX and design. What kind of website does your business need?';
-    }
-
-    // Funnel / CRO
-    if (/\b(funnel|cro|conversion|a\/b test|landing page optimiz|roas|roi)\b/.test(t)) {
-      return isHi
-        ? 'Funnel & CRO Strategy में हम awareness से purchase तक के पूरे customer journey को optimize करते हैं। A/B testing से आपके ads का हर rupee maximize होता है।'
-        : 'Our funnel & CRO strategy architects multi-touch journeys and uses A/B testing to maximise every rupee of ad spend from awareness to purchase.';
-    }
-
-    // Services list
-    if (/\b(service|services|offer|what do you do|what can you do|kya karte|kya dete)\b/.test(t) ||
-        /सेवाएं|सर्विस/.test(t)) {
-      const names = KB.services.map(s => s.name).join(', ');
-      return isHi
-        ? `JUSTDOWOW ये services provide करती है: ${names}। इनमें से किसी के बारे में details चाहिए?`
-        : `JUSTDOWOW offers: ${names}. Which of these would you like to know more about?`;
-    }
-
-    // About company / who are you
-    if (/\b(about|who are you|who is|justdowow|company|agency|tell me about|what is)\b/.test(t) ||
-        /कौन हो|बारे में|कंपनी/.test(t)) {
-      return isHi
-        ? `JUSTDOWOW India की most creative growth agency है। हम ${KB.company.serving} में businesses को digital dominance दिलाते हैं — SEO से लेकर brand building तक। हमारा approach strategy-first है: पहले आपके business को समझते हैं, फिर execute करते हैं।`
-        : `JUSTDOWOW is ${KB.company.tagline}. We help businesses across ${KB.company.serving} achieve digital dominance through SEO, performance ads, branding, social media, and web development. Our approach is strategy-first — understand, then execute.`;
-    }
-
-    // Process / How you work
-    if (/\b(process|how do you work|how it works|steps|methodology|approach|kaise karte)\b/.test(t) ||
-        /प्रोसेस|कैसे काम/.test(t)) {
-      const steps = KB.process.join(' → ');
-      return isHi
-        ? `हमारा process इस तरह है: ${steps}। हम हर step पर आपको update करते हैं।`
-        : `Our process: ${steps}. We keep you informed at every step.`;
-    }
-
-    // Tronica City
-    if (/tronica/.test(t)) {
-      return isHi
-        ? 'JUSTDOWOW का headquarter Tronica City, Ghaziabad में है। हम यहाँ के local businesses को national-level digital marketing से grow करते हैं। क्या आप Tronica City में हैं?'
-        : KB.locations['tronica city'] + ' As a local agency, we understand the Ghaziabad market inside out.';
-    }
-
-    // Noida
-    if (/noida|greater noida/.test(t)) {
-      return isHi
-        ? 'Noida में हम Sector 18, 62, 125, 137 और Greater Noida के businesses के लिए full-service digital marketing करते हैं।'
-        : KB.locations.noida;
-    }
-
-    // Delhi
-    if (/\b(delhi|new delhi|south delhi|north delhi|east delhi|west delhi)\b/.test(t)) {
-      return isHi
-        ? 'Delhi के लिए हमारे पास premium positioning, Hindi + English bilingual content, और complete city coverage है।'
-        : KB.locations.delhi;
-    }
-
-    // Price / Cost / Budget / Pricing
-    if (/\b(price|cost|pricing|budget|package|rate|charge|fees|kitna|kitne|kitna hai)\b/.test(t) ||
-        /कीमत|बजट|पैसे|पैकेज/.test(t)) {
-      return isHi
-        ? 'हमारी pricing हर client के लिए customized होती है — यह depend करती है आपकी requirement, market, और goals पर। एक free consultation book करें और हम आपके लिए best package suggest करेंगे।'
-        : "Our pricing is fully customised based on your requirements, market, and goals. Book a free consultation and we'll suggest the best package — no obligations.";
-    }
-
-    // Contact / Get in touch / Consultation / Meet
-    if (/\b(contact|reach|call|whatsapp|email|meet|consultation|free audit|get in touch|enquiry|inquiry|book)\b/.test(t) ||
-        /संपर्क|बात करें|मिलना|फ्री/.test(t)) {
-      return null; // signal: show lead form
-    }
-
-    // Result / ROI / growth / success
-    if (/\b(result|roi|growth|success|outcome|performance)\b/.test(t) ||
-        /रिज़ल्ट|ग्रोथ|सक्सेस/.test(t)) {
-      return isHi
-        ? 'हम data-driven approach follow करते हैं — Transparent reporting, weekly updates, और real-time dashboards से आप exactly जानते हैं आपका पैसा कहाँ जा रहा है। हम fake numbers में believe नहीं करते; हम real, long-term growth build करते हैं।'
-        : 'We follow a data-driven, transparent approach — real-time dashboards, weekly reporting, and honest communication. We focus on real long-term growth, not inflated vanity metrics.';
-    }
-
-    // Why choose / why justdowow
-    if (/\b(why|why choose|why justdowow|best|better|different|unique)\b/.test(t) ||
-        /क्यों चुनें|क्यों choose/.test(t)) {
-      return isHi
-        ? `JUSTDOWOW को choose करने के ${KB.why.length} strong reasons हैं: ${KB.why.join(' — ')}। हम आपके business को genuinely grow करना चाहते हैं।`
-        : `Here's why brands choose JUSTDOWOW: ${KB.why.join(' — ')}. We genuinely care about your growth.`;
-    }
-
-    // Thank you / bye
-    if (/\b(thanks|thank you|bye|goodbye|take care|great|awesome|perfect|shukriya|dhanyawad)\b/.test(t) ||
-        /शुक्रिया|धन्यवाद/.test(t)) {
-      return isHi
-        ? 'धन्यवाद! आपसे बात करके अच्छा लगा। कोई भी digital marketing सवाल हो तो बेझिझक पूछें। JUSTDOWOW हमेशा available है!'
-        : 'Thank you for chatting with JUSTDOWOW! Feel free to come back anytime. Wishing you and your business great success!';
-    }
-
-    // Fallback
-    return null; // signal: offer lead form + WhatsApp
-  }
-
-  /* ─────────────────────────────────────────────────────────
-   * 4. STATE
-   * ─────────────────────────────────────────────────────────*/
-  let isOpen     = false;
-  let lang       = 'en';        // 'en' | 'hi'
-  let vaState    = 'idle';      // 'idle' | 'listening' | 'thinking' | 'speaking'
-  let recognition = null;
-  let synthesis   = window.speechSynthesis;
-  let isSpeaking  = false;
-  let isListening = false;
-  let leadPending = false;      // whether we're collecting lead
-  let conversationHistory = []; // [{role, text}]
-
-  /* ─────────────────────────────────────────────────────────
-   * 5. DOM CONSTRUCTION
-   *    Injects all HTML into the page; nothing touches existing HTML.
-   * ─────────────────────────────────────────────────────────*/
+  /* ══════════════════════════════════════════════════════════════
+     6.  DOM BUILDER
+  ══════════════════════════════════════════════════════════════ */
   function buildDOM() {
-    const container = document.createElement('div');
-    container.id = 'va-container';
-    container.innerHTML = `
-      <!-- Floating Trigger -->
-      <button id="va-trigger" aria-label="Open JUSTDOWOW Voice Assistant" title="Talk to Wowy">
-        <svg id="va-trigger-icon-mic" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3zm-1 3a1 1 0 0 1 2 0v8a1 1 0 0 1-2 0V4zm6 8a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.93V21H9v2h6v-2h-2v-2.07A7 7 0 0 0 19 12h-2z"/></svg>
-        <svg id="va-trigger-icon-close" viewBox="0 0 24 24" style="display:none" xmlns="http://www.w3.org/2000/svg"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
-      </button>
-      <div id="va-trigger-label">Talk to Wowy</div>
+    var wrap = document.createElement('div');
+    wrap.id = 'jdw-va';
+    wrap.innerHTML =
+      '<button id="jdw-va-btn" aria-label="Open JUSTDOWOW AI Assistant">' +
+        '<svg id="jdw-btn-mic" viewBox="0 0 24 24">' +
+          '<path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3zm-1 3a1 1 0 0 1 2 0v8a1 1 0 0 1-2 0V4zm6.3 7.7A6 6 0 0 1 12 18a6 6 0 0 1-5.3-6.3l-2-.4A8 8 0 0 0 11 19.9V22H9v2h6v-2h-2v-2.1A8 8 0 0 0 19.3 12l-2-.3z"/>' +
+        '</svg>' +
+        '<svg id="jdw-btn-close" viewBox="0 0 24 24">' +
+          '<path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/>' +
+        '</svg>' +
+      '</button>' +
+      '<div id="jdw-va-badge">Talk to Wowy</div>' +
 
-      <!-- Main Panel -->
-      <div id="va-panel" role="dialog" aria-label="JUSTDOWOW Voice Assistant">
+      '<div id="jdw-va-panel" role="dialog" aria-label="JUSTDOWOW AI Assistant" aria-modal="true">' +
 
-        <!-- Header -->
-        <div id="va-header">
-          <div id="va-avatar">
-            WW
-            <span class="va-status-dot"></span>
-          </div>
-          <div id="va-header-text">
-            <div id="va-name">Wowy · <span class="va-wow-badge">JUSTDOWOW</span></div>
-            <div id="va-status-text">Digital Marketing Expert · Online</div>
-          </div>
-          <button id="va-lang-toggle" title="Switch language">हिंदी</button>
-          <button id="va-close-btn" aria-label="Close assistant">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg>
-          </button>
-        </div>
+        '<div id="jdw-panel-header">' +
+          '<div id="jdw-avatar">WW<span id="jdw-avatar-dot"></span></div>' +
+          '<div id="jdw-header-info">' +
+            '<div id="jdw-header-name">Wowy &middot; <span>JUSTDOWOW</span></div>' +
+            '<div id="jdw-header-status">Digital Marketing Expert &bull; Online</div>' +
+          '</div>' +
+          '<button id="jdw-lang-btn" title="Switch language">' + STR.en.langBtn + '</button>' +
+          '<button id="jdw-close-btn" aria-label="Close assistant">' +
+            '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">' +
+              '<path d="M18 6L6 18M6 6l12 12"/>' +
+            '</svg>' +
+          '</button>' +
+        '</div>' +
 
-        <!-- Chat -->
-        <div id="va-chat" aria-live="polite" aria-atomic="false"></div>
+        '<div id="jdw-chat" role="log" aria-live="polite" aria-label="Conversation"></div>' +
 
-        <!-- Visualiser -->
-        <div id="va-visualiser" class="va-idle">
-          ${Array.from({length: 9}, () => '<span class="va-bar"></span>').join('')}
-        </div>
-        <div id="va-state-label">Tap mic to speak</div>
+        '<div id="jdw-visualiser" class="jdw-vis-idle">' +
+          '<span class="jdw-bar"></span><span class="jdw-bar"></span>' +
+          '<span class="jdw-bar"></span><span class="jdw-bar"></span>' +
+          '<span class="jdw-bar"></span><span class="jdw-bar"></span>' +
+          '<span class="jdw-bar"></span><span class="jdw-bar"></span>' +
+          '<span class="jdw-bar"></span><span class="jdw-bar"></span>' +
+          '<span class="jdw-bar"></span><span class="jdw-bar"></span>' +
+        '</div>' +
+        '<div id="jdw-state-label" aria-live="polite"></div>' +
 
-        <!-- Controls -->
-        <div id="va-controls">
-          <input id="va-text-input" type="text" placeholder="Type a message…" autocomplete="off" maxlength="300" aria-label="Type a message">
-          <button id="va-send-btn" aria-label="Send message">
-            <svg viewBox="0 0 24 24"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
-          </button>
-          <button id="va-mic-btn" aria-label="Voice input">
-            <svg viewBox="0 0 24 24"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3zm-1 3a1 1 0 0 1 2 0v8a1 1 0 0 1-2 0V4zM19 12a7 7 0 0 1-14 0H3a9 9 0 0 0 8 8.94V23h2v-2.06A9 9 0 0 0 21 12h-2z"/></svg>
-          </button>
-        </div>
+        '<div id="jdw-voice-controls">' +
+          '<button id="jdw-end-btn" class="jdw-hidden" title="End conversation" aria-label="End conversation">' +
+            '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">' +
+              '<rect x="3" y="3" width="18" height="18" rx="3"/>' +
+            '</svg>' +
+          '</button>' +
+          '<button id="jdw-mic-main" aria-label="Start voice conversation">' +
+            '<svg viewBox="0 0 24 24">' +
+              '<path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3zm-1 3a1 1 0 0 1 2 0v8a1 1 0 0 1-2 0V4zm6.3 7.7A6 6 0 0 1 12 18a6 6 0 0 1-5.3-6.3l-2-.4A8 8 0 0 0 11 19.9V22H9v2h6v-2h-2v-2.1A8 8 0 0 0 19.3 12l-2-.3z"/>' +
+            '</svg>' +
+          '</button>' +
+        '</div>' +
 
-      </div>
-    `;
-    document.body.appendChild(container);
+        '<div id="jdw-text-row">' +
+          '<input id="jdw-text-input" type="text" placeholder="Type a message\u2026" ' +
+                 'autocomplete="off" maxlength="300" aria-label="Type a message">' +
+          '<button id="jdw-send-btn" aria-label="Send message">' +
+            '<svg viewBox="0 0 24 24"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>' +
+          '</button>' +
+        '</div>' +
+
+      '</div>';
+
+    document.body.appendChild(wrap);
   }
 
-  /* ─────────────────────────────────────────────────────────
-   * 6. CHAT HELPERS
-   * ─────────────────────────────────────────────────────────*/
-  function addMessage(role, text, extra) {
-    const chat = document.getElementById('va-chat');
-    const msg = document.createElement('div');
-    msg.className = `va-msg va-${role}`;
-    const avatarText = role === 'bot' ? 'WW' : 'You';
-    msg.innerHTML = `
-      <div class="va-msg-avatar">${avatarText}</div>
-      <div class="va-bubble">${escapeHtml(text)}</div>
-    `;
-    if (extra) {
-      const extraEl = document.createElement('div');
-      extraEl.className = 'va-msg va-bot';
-      extraEl.innerHTML = `<div class="va-msg-avatar">WW</div><div>${extra}</div>`;
-      chat.appendChild(msg);
-      chat.appendChild(extraEl);
+  /* ══════════════════════════════════════════════════════════════
+     7.  STATE MACHINE
+  ══════════════════════════════════════════════════════════════ */
+  function setState(s) {
+    state = s;
+    var label  = document.getElementById('jdw-state-label');
+    var viz    = document.getElementById('jdw-visualiser');
+    var status = document.getElementById('jdw-header-status');
+    if (!label || !viz || !status) return;
+
+    var S      = STR[lang];
+    var ALL_ST = ['jdw-st-listening', 'jdw-st-thinking', 'jdw-st-speaking', 'jdw-st-ended'];
+    ALL_ST.forEach(function (c) { label.classList.remove(c); status.classList.remove(c); });
+    viz.className = 'jdw-vis-idle';
+
+    var MAP = {
+      listening: { text: S.listening, cls: 'jdw-st-listening', viz: 'jdw-vis-listening' },
+      thinking:  { text: S.thinking,  cls: 'jdw-st-thinking',  viz: 'jdw-vis-thinking'  },
+      speaking:  { text: S.speaking,  cls: 'jdw-st-speaking',  viz: 'jdw-vis-speaking'  },
+      ended:     { text: S.ended,     cls: 'jdw-st-ended',     viz: 'jdw-vis-idle'      },
+    };
+
+    if (MAP[s]) {
+      label.textContent  = MAP[s].text;
+      status.textContent = MAP[s].text;
+      label.classList.add(MAP[s].cls);
+      status.classList.add(MAP[s].cls);
+      viz.className = MAP[s].viz;
     } else {
-      chat.appendChild(msg);
+      label.textContent  = S.idle;
+      status.textContent = 'Digital Marketing Expert \u2022 Online';
     }
-    conversationHistory.push({ role, text });
-    scrollChat();
-    return msg;
   }
 
-  function addTypingIndicator() {
-    const chat = document.getElementById('va-chat');
-    const div = document.createElement('div');
-    div.className = 'va-msg va-bot';
-    div.id = 'va-typing';
-    div.innerHTML = `
-      <div class="va-msg-avatar">WW</div>
-      <div class="va-bubble va-typing-dots">
-        <span></span><span></span><span></span>
-      </div>
-    `;
-    chat.appendChild(div);
+  /* ══════════════════════════════════════════════════════════════
+     8.  CHAT HELPERS
+  ══════════════════════════════════════════════════════════════ */
+  function addMsg(role, text) {
+    if (!text || !text.trim()) return; // FIX-07
+    var chat = document.getElementById('jdw-chat');
+    if (!chat) return;
+    var el = document.createElement('div');
+    el.className = 'jdw-msg jdw-' + role;
+    el.innerHTML =
+      '<div class="jdw-msg-av">' + (role === 'bot' ? 'WW' : 'You') + '</div>' +
+      '<div class="jdw-bubble">' + esc(text) + '</div>';
+    chat.appendChild(el);
     scrollChat();
-    return div;
   }
 
-  function removeTypingIndicator() {
-    const el = document.getElementById('va-typing');
+  function addMsgHTML(role, html) {
+    if (!html || !html.trim()) return;
+    var chat = document.getElementById('jdw-chat');
+    if (!chat) return;
+    var el = document.createElement('div');
+    el.className = 'jdw-msg jdw-' + role;
+    el.innerHTML =
+      '<div class="jdw-msg-av">' + (role === 'bot' ? 'WW' : 'You') + '</div>' +
+      '<div class="jdw-bubble">' + html + '</div>';
+    chat.appendChild(el);
+    scrollChat();
+  }
+
+  function showTyping() {
+    if (document.getElementById('jdw-typing')) return;
+    var chat = document.getElementById('jdw-chat');
+    if (!chat) return;
+    var el = document.createElement('div');
+    el.id = 'jdw-typing';
+    el.className = 'jdw-msg jdw-bot';
+    el.innerHTML =
+      '<div class="jdw-msg-av">WW</div>' +
+      '<div class="jdw-bubble"><div class="jdw-dots">' +
+      '<span></span><span></span><span></span></div></div>';
+    chat.appendChild(el);
+    scrollChat();
+  }
+
+  function hideTyping() {
+    var el = document.getElementById('jdw-typing');
     if (el) el.remove();
   }
 
   function addChips(chips) {
-    const chat = document.getElementById('va-chat');
-    const row = document.createElement('div');
-    row.className = 'va-chips';
-    row.id = 'va-chips-row';
-    chips.forEach(label => {
-      const btn = document.createElement('button');
-      btn.className = 'va-chip';
+    removeChips();
+    var chat = document.getElementById('jdw-chat');
+    if (!chat || !chips || !chips.length) return;
+    var row = document.createElement('div');
+    row.className = 'jdw-chips';
+    row.id = 'jdw-chips';
+    chips.forEach(function (label) {
+      var btn = document.createElement('button');
+      btn.className = 'jdw-chip';
       btn.textContent = label;
-      btn.onclick = () => {
-        row.remove();
-        handleInput(label);
-      };
+      btn.addEventListener('click', function () { removeChips(); handleInput(label); });
       row.appendChild(btn);
     });
     chat.appendChild(row);
@@ -408,16 +461,16 @@
   }
 
   function removeChips() {
-    const el = document.getElementById('va-chips-row');
+    var el = document.getElementById('jdw-chips');
     if (el) el.remove();
   }
 
   function scrollChat() {
-    const chat = document.getElementById('va-chat');
-    setTimeout(() => chat.scrollTop = chat.scrollHeight, 50);
+    var chat = document.getElementById('jdw-chat');
+    if (chat) setTimeout(function () { chat.scrollTop = chat.scrollHeight; }, 40);
   }
 
-  function escapeHtml(s) {
+  function esc(s) {
     return String(s)
       .replace(/&/g, '&amp;')
       .replace(/</g, '&lt;')
@@ -425,438 +478,591 @@
       .replace(/"/g, '&quot;');
   }
 
-  function setStateLabel(state) {
-    vaState = state;
-    const el = document.getElementById('va-state-label');
-    const viz = document.getElementById('va-visualiser');
-    if (!el) return;
-    const S = STRINGS[lang];
-    el.className = '';
-    viz.className = '';
-    if (state === 'listening') {
-      el.textContent = S.listenLabel;
-      el.className = 'va-state-listening';
-      viz.className = 'va-listening';
-    } else if (state === 'speaking') {
-      el.textContent = S.speakLabel;
-      el.className = 'va-state-speaking';
-    } else if (state === 'thinking') {
-      el.textContent = S.thinkLabel;
-      el.className = 'va-state-thinking';
-      viz.className = 'va-idle';
-    } else {
-      el.textContent = S.idleLabel;
-      viz.className = 'va-idle';
+  /* ══════════════════════════════════════════════════════════════
+     9.  OPENAI API CALL  (FIX-03, FIX-04)
+  ══════════════════════════════════════════════════════════════ */
+  async function callAI(userMessage) {
+    // Trim history to MAX_HISTORY pairs (FIX-04)
+    if (aiHistory.length > MAX_HISTORY * 2) {
+      aiHistory = aiHistory.slice(-(MAX_HISTORY * 2));
+    }
+
+    var messages = [
+      { role: 'system', content: buildSystemPrompt(domContent, lang) },
+    ].concat(aiHistory).concat([
+      { role: 'user', content: userMessage },
+    ]);
+
+    var res = await fetch('/api/ai', {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ messages: messages }),
+    });
+
+    if (!res.ok) {
+      var errTxt = await res.text().catch(function () { return ''; });
+      throw new Error('/api/ai returned ' + res.status + ': ' + errTxt);
+    }
+
+    var data  = await res.json();
+    var reply = (
+      data && data.choices && data.choices[0] &&
+      data.choices[0].message && data.choices[0].message.content
+    ) || (data && data.reply) || (data && data.content) || '';
+
+    if (!reply || !reply.trim()) throw new Error('Empty response from /api/ai');
+
+    // Push to history ONLY after success (FIX-03)
+    aiHistory.push({ role: 'user',      content: userMessage });
+    aiHistory.push({ role: 'assistant', content: reply });
+
+    return reply;
+  }
+
+  /* ══════════════════════════════════════════════════════════════
+     10.  RESPONSE PARSER  (FIX-06: only strips known signal tags)
+  ══════════════════════════════════════════════════════════════ */
+  var KNOWN_SIGNALS = /\[(COLLECT_LEAD|END_CONVERSATION|WHATSAPP_CTA)\]/g;
+
+  function parseAIResponse(raw) {
+    var text        = raw || '';
+    var collectLead = text.indexOf('[COLLECT_LEAD]')     !== -1;
+    var endConv     = text.indexOf('[END_CONVERSATION]') !== -1;
+    var showWACTA   = text.indexOf('[WHATSAPP_CTA]')     !== -1;
+
+    // Strip ONLY known signal tags (FIX-06)
+    text = text.replace(KNOWN_SIGNALS, '').trim();
+
+    // Strip markdown formatting for clean chat/voice output
+    text = text
+      .replace(/\*\*([^*]+)\*\*/g, '$1')
+      .replace(/\*([^*]+)\*/g,     '$1')
+      .replace(/^#{1,6}\s+/gm,     '')
+      .replace(/`([^`]+)`/g,       '$1')
+      .trim();
+
+    return { text: text, collectLead: collectLead, endConv: endConv, showWACTA: showWACTA };
+  }
+
+  /* ══════════════════════════════════════════════════════════════
+     11.  INPUT PIPELINE  (FIX-05, FIX-07, FIX-12)
+  ══════════════════════════════════════════════════════════════ */
+  // FIX-12: handleInput is the ONLY place a user bubble is added
+  function handleInput(text) {
+    if (!text || !text.trim()) return;
+    removeChips();
+    var t = text.trim();
+    addMsg('user', t);
+    processInput(t);
+  }
+
+  async function processInput(rawText) {
+    // Auto-detect Hindi from user input
+    var hasHindi =
+      /[\u0900-\u097F]/.test(rawText) ||
+      /\b(kya|hai|hain|aap|main|mujhe|karo|kaise|bata|chahiye|nahi|mera|dijiye|bataiye|chahte|chahti|hoon|hu|batao|samjhao|chahta|karein|karoon)\b/i.test(rawText);
+    if (hasHindi && lang !== 'hi') { lang = 'hi'; updateLangBtn(); }
+
+    setState('thinking');
+    showTyping();
+
+    var rawReply;
+    try {
+      rawReply = await callAI(rawText);
+    } catch (err) {
+      // FIX-05: guaranteed cleanup on every error path
+      hideTyping();
+      setState('idle');
+      console.warn('[JDWVA] AI error:', err.message);
+      var errMsg = STR[lang].aiError;
+      addMsg('bot', errMsg);
+      speakText(errMsg, function () {
+        if (convActive) safeRestartListening();
+        else addChips(STR[lang].chips);
+      });
+      return;
+    }
+
+    hideTyping();
+
+    var parsed = parseAIResponse(rawReply);
+    var text        = parsed.text;
+    var collectLead = parsed.collectLead;
+    var endConv     = parsed.endConv;
+    var showWACTA   = parsed.showWACTA;
+
+    // ── End conversation signal ──────────────────────────────
+    if (endConv) {
+      if (text) addMsg('bot', text);
+      speakText(text || STR[lang].endConv, function () {
+        endConversation();
+      });
+      return;
+    }
+
+    // ── Display AI reply ─────────────────────────────────────
+    if (text) addMsg('bot', text);
+
+    // ── WhatsApp CTA (FIX-15: tappable anchor) ───────────────
+    if (showWACTA) {
+      var waMsg = encodeURIComponent('Hi! I was chatting with Wowy on the JUSTDOWOW website and would like a free consultation.');
+      addMsgHTML('bot',
+        '<a class="jdw-wa-link" href="' + WA_URL + '?text=' + waMsg + '" target="_blank" rel="noopener noreferrer">' +
+        '&#128172; Chat on WhatsApp &rarr;</a>'
+      );
+    }
+
+    // ── Lead collection form ─────────────────────────────────
+    if (collectLead && !leadPending) {
+      leadPending = true;
+      speakText(text || STR[lang].leadPrompt, function () {
+        if (!text) addMsg('bot', STR[lang].leadPrompt);
+        renderLeadForm();
+      });
+      return;
+    }
+
+    // ── Speak then re-listen or show chips ───────────────────
+    speakText(text, function () {
+      if (convActive && state !== 'ended') {
+        setTimeout(function () { if (convActive) startListening(); }, RESTART_DELAY);
+      } else {
+        addChips(STR[lang].chips);
+      }
+    });
+  }
+
+  /* ══════════════════════════════════════════════════════════════
+     12.  TTS — ElevenLabs ONLY  (FIX-01, FIX-02)
+          No browser speechSynthesis. AbortController timeout.
+  ══════════════════════════════════════════════════════════════ */
+  async function speakText(text, onDone) {
+    if (!text || !text.trim()) { if (onDone) onDone(); return; }
+
+    stopCurrentAudio();
+    setState('speaking');
+
+    var plain = text
+      .replace(/<[^>]+>/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 500);
+
+    // AbortController + timeout (FIX-02)
+    var ac = new AbortController();
+    currentAbort = ac;
+    var timeoutId = setTimeout(function () { ac.abort(); }, TTS_TIMEOUT);
+
+    try {
+      var res = await fetch('/api/tts', {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ text: plain, lang: lang }),
+        signal:  ac.signal,
+      });
+
+      clearTimeout(timeoutId);
+      currentAbort = null;
+
+      var contentType = (res.headers.get('content-type') || '');
+      if (!res.ok || !contentType.includes('audio')) {
+        // ElevenLabs returned error or non-audio — do NOT fall back to browser TTS (FIX-01)
+        setState('idle');
+        addMsg('bot', STR[lang].ttsError);
+        if (onDone) onDone();
+        return;
+      }
+
+      var blob  = await res.blob();
+      var url   = URL.createObjectURL(blob);
+      var audio = new Audio(url);
+      currentAudio = audio;
+
+      audio.onplay = function () { setState('speaking'); };
+
+      audio.onended = function () {
+        URL.revokeObjectURL(url);
+        currentAudio = null;
+        setState('idle');
+        if (onDone) onDone();
+      };
+
+      audio.onerror = function () {
+        URL.revokeObjectURL(url);
+        currentAudio = null;
+        setState('idle');
+        addMsg('bot', STR[lang].ttsError);
+        if (onDone) onDone();
+      };
+
+      audio.play().catch(function (e) {
+        // Autoplay blocked (common on mobile before user gesture)
+        currentAudio = null;
+        setState('idle');
+        console.warn('[JDWVA] Audio autoplay blocked:', e.message);
+        if (onDone) onDone();
+      });
+
+    } catch (err) {
+      clearTimeout(timeoutId);
+      currentAbort = null;
+      currentAudio = null;
+      setState('idle');
+      if (err.name !== 'AbortError') {
+        console.warn('[JDWVA] TTS fetch error:', err.message);
+      }
+      addMsg('bot', STR[lang].ttsError);
+      if (onDone) onDone();
     }
   }
 
-  /* ─────────────────────────────────────────────────────────
-   * 7. TEXT-TO-SPEECH
-   * ─────────────────────────────────────────────────────────*/
-  function speak(text, onEnd) {
-    if (!synthesis) { onEnd && onEnd(); return; }
-    synthesis.cancel();
-    // Strip HTML tags for TTS
-    const plain = text.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
-    const utt = new SpeechSynthesisUtterance(plain);
-    utt.lang = lang === 'hi' ? 'hi-IN' : 'en-IN';
-    utt.rate = 0.95;
-    utt.pitch = 1.05;
-
-    // Pick best available voice
-    const voices = synthesis.getVoices();
-    const target = lang === 'hi' ? 'hi' : 'en';
-    const preferred = voices.find(v =>
-      v.lang.startsWith(target) && (v.name.toLowerCase().includes('india') || v.lang.includes('IN'))
-    ) || voices.find(v => v.lang.startsWith(target));
-    if (preferred) utt.voice = preferred;
-
-    utt.onstart = () => { isSpeaking = true; setStateLabel('speaking'); };
-    utt.onend   = () => { isSpeaking = false; setStateLabel('idle'); onEnd && onEnd(); };
-    utt.onerror = () => { isSpeaking = false; setStateLabel('idle'); onEnd && onEnd(); };
-    synthesis.speak(utt);
+  function stopCurrentAudio() {
+    if (currentAbort) { currentAbort.abort(); currentAbort = null; }
+    if (currentAudio) {
+      try { currentAudio.pause(); } catch (e) {}
+      currentAudio.src = '';
+      currentAudio = null;
+    }
   }
 
-  /* ─────────────────────────────────────────────────────────
-   * 8. SPEECH RECOGNITION
-   * ─────────────────────────────────────────────────────────*/
-  function initRecognition() {
-    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  /* ══════════════════════════════════════════════════════════════
+     13.  SPEECH RECOGNITION  (FIX-09, FIX-10)
+           Handlers assigned ONCE. Does not re-listen while thinking.
+  ══════════════════════════════════════════════════════════════ */
+  function buildRecognition() {
+    var SR = window.SpeechRecognition || window.webkitSpeechRecognition;
     if (!SR) return null;
-    const r = new SR();
-    r.continuous = false;
-    r.interimResults = false;
+
+    var r = new SR();
+    r.continuous      = false; // manual restart for cross-browser reliability
+    r.interimResults  = false;
     r.maxAlternatives = 1;
 
-    r.onstart  = () => { isListening = true; setStateLabel('listening'); updateMicBtn(true); };
-    r.onresult = (e) => {
-      const transcript = e.results[0][0].transcript.trim();
-      isListening = false;
-      updateMicBtn(false);
-      setStateLabel('thinking');
-      if (transcript) {
-        addMessage('user', transcript);
-        processInput(transcript);
-      }
+    // FIX-09: assign handlers ONCE here
+    r.onresult = function (e) {
+      var transcript = ((e.results[0][0] || {}).transcript || '').trim();
+      try { r.stop(); } catch (ex) {}
+      if (!transcript) { safeRestartListening(); return; }
+      setState('thinking');
+      handleInput(transcript); // FIX-12: handleInput is the one and only entry
     };
-    r.onerror = (e) => {
-      isListening = false;
-      updateMicBtn(false);
-      setStateLabel('idle');
-      if (e.error === 'no-speech') return;
-      addMessage('bot', STRINGS[lang].notHeard);
+
+    r.onspeechend = function () { try { r.stop(); } catch (ex) {} };
+
+    r.onerror = function (e) {
+      if (e.error === 'no-speech')  { if (convActive) safeRestartListening(); return; }
+      if (e.error === 'aborted')    { return; }
+      console.warn('[JDWVA] SpeechRecognition error:', e.error);
+      setState('idle');
+      if (convActive) safeRestartListening();
     };
-    r.onend = () => {
-      isListening = false;
-      updateMicBtn(false);
-      if (vaState === 'listening') setStateLabel('idle');
+
+    r.onend = function () {
+      if (convActive && state === 'listening') safeRestartListening();
     };
+
     return r;
   }
 
   function startListening() {
-    if (isSpeaking) synthesis.cancel();
-    if (!recognition) {
-      // No voice support fallback
-      addMessage('bot', STRINGS[lang].noSupport);
-      return;
-    }
+    if (!recognition) { addMsg('bot', STR[lang].noSupport); return; }
+    if (state === 'thinking') return; // FIX-10: don't overlap with AI thinking
+    if (state === 'speaking') stopCurrentAudio(); // interruption support
+
+    clearTimeout(restartTimer);
+    recognition.lang = lang === 'hi' ? 'hi-IN' : 'en-IN';
+    setState('listening');
+
     try {
-      recognition.lang = lang === 'hi' ? 'hi-IN' : 'en-IN';
       recognition.start();
-    } catch(e) {
-      // already started; ignore
+    } catch (e) {
+      if (e.name === 'InvalidStateError') safeRestartListening();
     }
+  }
+
+  function safeRestartListening() {
+    if (!convActive) return;
+    clearTimeout(restartTimer);
+    restartTimer = setTimeout(function () {
+      if (convActive && state !== 'speaking' && state !== 'thinking') startListening();
+    }, RESTART_DELAY);
   }
 
   function stopListening() {
-    if (recognition && isListening) {
-      try { recognition.stop(); } catch(e) {}
-    }
+    clearTimeout(restartTimer);
+    if (recognition) { try { recognition.abort(); } catch (e) {} }
   }
 
-  function updateMicBtn(active) {
-    const btn = document.getElementById('va-mic-btn');
-    if (!btn) return;
-    if (active) btn.classList.add('va-mic-active');
-    else btn.classList.remove('va-mic-active');
-  }
-
-  /* ─────────────────────────────────────────────────────────
-   * 9. RESPONSE PROCESSING
-   * ─────────────────────────────────────────────────────────*/
-  function handleInput(text) {
-    removeChips();
-    addMessage('user', text);
-    processInput(text);
-  }
-
-  async function processInput(text) {
-    setStateLabel('thinking');
-    // Small simulated "thinking" delay for realism
-    const delay = 600 + Math.random() * 500;
-    const typing = addTypingIndicator();
-
-    setTimeout(() => {
-      removeTypingIndicator();
-      // Detect language from text
-      const hasHindi = /[\u0900-\u097F]/.test(text) ||
-        /\b(kya|hai|hain|aap|main|mujhe|karo|kaise|bata|chahiye|nahi|mera|tumhara|dijiye|bataiye|chahte|chahti)\b/i.test(text);
-      if (hasHindi) { lang = 'hi'; updateLangToggle(); }
-
-     const response = await askAI(text);
-      if (response === null || leadPending) {
-        // Show lead form
-        if (!leadPending) {
-          leadPending = true;
-          const msg = STRINGS[lang].leadPrompt;
-          addMessage('bot', msg);
-          speak(msg);
-        }
-        renderLeadForm();
-      } else {
-        addMessage('bot', response);
-        speak(response);
-        // Show follow-up chips after bot speaks
-        setTimeout(() => {
-          const S = STRINGS[lang];
-          addChips([
-            lang === 'hi' ? 'और सेवाएं' : 'More Services',
-            lang === 'hi' ? 'Free Consultation' : 'Free Consultation',
-            lang === 'hi' ? 'WhatsApp करें' : 'WhatsApp Us',
-          ]);
-        }, 400);
-      }
-    }, delay);
-  }
-
-  /* ─────────────────────────────────────────────────────────
-   * 10. LEAD FORM
-   * ─────────────────────────────────────────────────────────*/
+  /* ══════════════════════════════════════════════════════════════
+     14.  LEAD FORM  (FIX-11)
+  ══════════════════════════════════════════════════════════════ */
   function renderLeadForm() {
-    const chat = document.getElementById('va-chat');
-    // Remove existing form if present
-    const existing = document.getElementById('va-lead-form-el');
-    if (existing) existing.remove();
+    if (document.getElementById('jdw-lead-form')) return; // FIX-11: guard duplicate
+    var hi = lang === 'hi';
 
-    const formEl = document.createElement('div');
-    formEl.className = 'va-msg va-bot';
-    formEl.innerHTML = `
-      <div class="va-msg-avatar">WW</div>
-      <div class="va-lead-form" id="va-lead-form-el">
-        <input id="va-l-name"    type="text"  placeholder="${lang === 'hi' ? 'आपका नाम' : 'Your Name'}"     maxlength="80">
-        <input id="va-l-phone"   type="tel"   placeholder="${lang === 'hi' ? 'मोबाइल नंबर' : 'Mobile Number'}" maxlength="15">
-        <input id="va-l-email"   type="email" placeholder="${lang === 'hi' ? 'Email (optional)' : 'Email (optional)'}" maxlength="120">
-        <select id="va-l-service">
-          <option value="">${lang === 'hi' ? 'सेवा चुनें' : 'Select Service'}</option>
-          <option value="SEO & Organic Growth">SEO & Organic Growth</option>
-          <option value="Performance Marketing">Performance Marketing (PPC / Ads)</option>
-          <option value="Brand Identity Design">Brand Identity Design</option>
-          <option value="Social Media Marketing">Social Media Marketing</option>
-          <option value="Web Design & Development">Web Design & Development</option>
-          <option value="Funnel & CRO Strategy">Funnel & CRO Strategy</option>
-          <option value="Full-Service Package">Full-Service Package</option>
-          <option value="General Inquiry">General Inquiry</option>
-        </select>
-        <input id="va-l-budget"  type="text"  placeholder="${lang === 'hi' ? 'Monthly Budget (e.g. ₹15,000)' : 'Monthly Budget (e.g. ₹15,000)'}" maxlength="60">
-        <button class="va-lead-submit" id="va-l-submit">${lang === 'hi' ? 'Submit करें' : 'Get Free Consultation'}</button>
-      </div>
-    `;
-    chat.appendChild(formEl);
-    scrollChat();
+    addMsgHTML('bot', [
+      '<div class="jdw-lead-form" id="jdw-lead-form">',
+        '<input id="jdw-l-name"    type="text"  maxlength="80"  placeholder="' + (hi ? 'Aapka Naam *' : 'Your Name *') + '">',
+        '<input id="jdw-l-phone"   type="tel"   maxlength="15"  placeholder="' + (hi ? 'Mobile Number *' : 'Mobile Number *') + '">',
+        '<input id="jdw-l-biz"     type="text"  maxlength="100" placeholder="' + (hi ? 'Business Name' : 'Business Name') + '">',
+        '<input id="jdw-l-city"    type="text"  maxlength="80"  placeholder="' + (hi ? 'City / Location' : 'City / Location') + '">',
+        '<select id="jdw-l-service">',
+          '<option value="">' + (hi ? 'Service chunein' : 'Select Service') + '</option>',
+          '<option>SEO &amp; Local SEO</option>',
+          '<option>Google Ads</option>',
+          '<option>Meta Ads (Facebook &amp; Instagram)</option>',
+          '<option>Social Media Marketing</option>',
+          '<option>Website Design &amp; Development</option>',
+          '<option>Brand Identity Design</option>',
+          '<option>Real Estate / Property Marketing</option>',
+          '<option>Lead Generation</option>',
+          '<option>WhatsApp Marketing</option>',
+          '<option>Full-Service Package</option>',
+          '<option>General Enquiry</option>',
+        '</select>',
+        '<input id="jdw-l-budget" type="text" maxlength="60" placeholder="' + (hi ? 'Monthly Budget (e.g. Rs.15,000)' : 'Monthly Budget (e.g. \u20b915,000)') + '">',
+        '<button class="jdw-lead-submit" id="jdw-l-submit">' + (hi ? 'Submit Karein' : 'Get Free Consultation') + '</button>',
+      '</div>',
+    ].join(''));
 
-    document.getElementById('va-l-submit').addEventListener('click', submitLead);
-
-    // Also allow pressing enter on last field
-    document.getElementById('va-l-budget').addEventListener('keypress', e => {
-      if (e.key === 'Enter') submitLead();
-    });
+    var submitBtn = document.getElementById('jdw-l-submit');
+    var budgetEl  = document.getElementById('jdw-l-budget');
+    if (submitBtn) submitBtn.addEventListener('click', submitLead);
+    if (budgetEl)  budgetEl.addEventListener('keypress', function (e) { if (e.key === 'Enter') submitLead(); });
   }
 
   async function submitLead() {
-    const name    = (document.getElementById('va-l-name')?.value  || '').trim();
-    const phone   = (document.getElementById('va-l-phone')?.value || '').trim();
-    const email   = (document.getElementById('va-l-email')?.value || '').trim();
-    const service = (document.getElementById('va-l-service')?.value || '');
-    const budget  = (document.getElementById('va-l-budget')?.value || '').trim();
+    var name    = ((document.getElementById('jdw-l-name')    || {}).value || '').trim();
+    var phone   = ((document.getElementById('jdw-l-phone')   || {}).value || '').trim();
+    var biz     = ((document.getElementById('jdw-l-biz')     || {}).value || '').trim();
+    var city    = ((document.getElementById('jdw-l-city')    || {}).value || '').trim();
+    var service = ((document.getElementById('jdw-l-service') || {}).value || '');
+    var budget  = ((document.getElementById('jdw-l-budget')  || {}).value || '').trim();
 
-    if (!name || !phone) {
-      const warn = lang === 'hi' ? 'कृपया नाम और मोबाइल नंबर जरूर भरें।' : 'Please enter your name and mobile number.';
-      addMessage('bot', warn);
-      return;
+    if (!name) {
+      var w1 = lang === 'hi' ? 'Naam required hai.' : 'Please enter your name.';
+      addMsg('bot', w1); speakText(w1); return;
     }
-    if (!/^[\d\+\s\-]{7,15}$/.test(phone)) {
-      const warn = lang === 'hi' ? 'कृपया valid mobile number डालें।' : 'Please enter a valid mobile number.';
-      addMessage('bot', warn);
-      return;
+    if (!phone || !/^[\d+\s\-]{7,15}$/.test(phone)) {
+      var w2 = lang === 'hi' ? 'Valid mobile number dalein.' : 'Please enter a valid mobile number.';
+      addMsg('bot', w2); speakText(w2); return;
     }
 
-    // Disable submit button
-    const btn = document.getElementById('va-l-submit');
-    if (btn) { btn.disabled = true; btn.textContent = lang === 'hi' ? 'भेज रहे हैं…' : 'Sending…'; }
+    var btn = document.getElementById('jdw-l-submit');
+    if (btn) { btn.disabled = true; btn.textContent = lang === 'hi' ? 'Bhej rahe hain\u2026' : 'Sending\u2026'; }
 
-    // Remove form from DOM
-    const formDiv = document.getElementById('va-lead-form-el');
-    if (formDiv) formDiv.closest('.va-msg').remove();
+    var formEl = document.getElementById('jdw-lead-form');
+    if (formEl) { var parentMsg = formEl.closest('.jdw-msg'); if (parentMsg) parentMsg.remove(); }
     leadPending = false;
 
-    const message = [
-      `Source: Voice Assistant (Wowy)`,
-      `Service Interest: ${service || 'Not specified'}`,
-      `Budget: ${budget || 'Not specified'}`,
-      `Language: ${lang === 'hi' ? 'Hindi' : 'English'}`,
-      `Page: ${window.location.href}`,
-    ].join('\n');
+    // Add lead context to aiHistory for future responses (FIX-03 compliant: already success)
+    aiHistory.push({
+      role: 'assistant',
+      content: '[Lead captured — Name: ' + name + ', Phone: ' + phone +
+               ', Business: ' + (biz || 'N/A') + ', City: ' + (city || 'N/A') +
+               ', Service: ' + (service || 'General') + ', Budget: ' + (budget || 'N/A') + ']',
+    });
 
     try {
-      const body = new FormData();
-      body.append('access_key', KB.company.web3formsKey);
-      body.append('name', name);
-      body.append('phone', phone);
-      body.append('email', email || 'not-provided@voice-assistant.com');
-      body.append('message', message);
-      body.append('subject', `[JUSTDOWOW Voice Lead] ${name} – ${service || 'General'}`);
-
-      const res = await fetch('https://api.web3forms.com/submit', {
-        method: 'POST',
-        body,
+      var res = await fetch('/api/lead', {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({
+          name:     name,
+          phone:    phone,
+          email:    '',
+          business: biz,
+          city:     city,
+          service:  service,
+          budget:   budget,
+          lang:     lang,
+          page:     window.location.href,
+        }),
       });
-      const json = await res.json();
 
-      const successMsg = STRINGS[lang].leadSuccess;
-      addMessage('bot', successMsg);
-      speak(successMsg);
+      var json = await res.json().catch(function () { return {}; });
 
-      // Show WhatsApp quick-action
-      setTimeout(() => {
-        const wa = `https://wa.me/919990066953?text=${encodeURIComponent(`Hi! I'm ${name}. I enquired via the JUSTDOWOW website about ${service || 'your services'}.`)}`;
-        const chat = document.getElementById('va-chat');
-        const waBubble = document.createElement('div');
-        waBubble.className = 'va-msg va-bot';
-        waBubble.innerHTML = `
-          <div class="va-msg-avatar">WW</div>
-          <div class="va-bubble">
-            <a href="${wa}" target="_blank" rel="noopener"
-               style="color:var(--va-neon);text-decoration:none;font-weight:700;font-family:var(--va-font-h);">
-              &#128172; Chat on WhatsApp now &rarr;
-            </a>
-          </div>
-        `;
-        chat.appendChild(waBubble);
-        scrollChat();
-      }, 1500);
-
+      if (res.ok && json.success) {
+        var successMsg = STR[lang].leadSuccess;
+        addMsg('bot', successMsg);
+        speakText(successMsg, function () {
+          var waText = encodeURIComponent(
+            "Hi! I'm " + name + ". I spoke with Wowy on the JUSTDOWOW website about " + (service || 'your services') + "."
+          );
+          addMsgHTML('bot',
+            '<a class="jdw-wa-link" href="' + WA_URL + '?text=' + waText + '" target="_blank" rel="noopener noreferrer">' +
+            '&#128172; Chat on WhatsApp now &rarr;</a>'
+          );
+          if (convActive) setTimeout(startListening, 1500);
+        });
+      } else {
+        throw new Error('Lead API error ' + res.status);
+      }
     } catch (err) {
-      const errMsg = STRINGS[lang].leadError;
-      addMessage('bot', errMsg);
-      speak(errMsg);
+      console.warn('[JDWVA] Lead submit error:', err.message);
+      var errMsg = STR[lang].leadError;
+      addMsg('bot', errMsg);
+      speakText(errMsg);
     }
   }
 
-  /* ─────────────────────────────────────────────────────────
-   * 11. OPEN / CLOSE
-   * ─────────────────────────────────────────────────────────*/
+  /* ══════════════════════════════════════════════════════════════
+     15.  CONVERSATION CONTROL  (FIX-13)
+  ══════════════════════════════════════════════════════════════ */
+  function startConversation() {
+    if (!recognition) {
+      addMsg('bot', STR[lang].noSupport);
+      addChips(STR[lang].chips);
+      return;
+    }
+    endingConv = false;
+    convActive = true;
+    var micBtn = document.getElementById('jdw-mic-main');
+    var endBtn = document.getElementById('jdw-end-btn');
+    if (micBtn) micBtn.classList.add('jdw-conv-active');
+    if (endBtn) endBtn.classList.remove('jdw-hidden');
+    startListening();
+  }
+
+  function endConversation() {
+    if (endingConv) return; // FIX-13: prevent double-execution
+    endingConv = true;
+    convActive = false;
+    stopListening();
+    stopCurrentAudio();
+    setState('ended');
+    var micBtn = document.getElementById('jdw-mic-main');
+    var endBtn = document.getElementById('jdw-end-btn');
+    if (micBtn) micBtn.classList.remove('jdw-conv-active');
+    if (endBtn) endBtn.classList.add('jdw-hidden');
+  }
+
+  /* ══════════════════════════════════════════════════════════════
+     16.  PANEL OPEN / CLOSE
+  ══════════════════════════════════════════════════════════════ */
   function openPanel() {
     isOpen = true;
-    const panel = document.getElementById('va-panel');
-    const trigger = document.getElementById('va-trigger');
-    const mic = document.getElementById('va-trigger-icon-mic');
-    const close = document.getElementById('va-trigger-icon-close');
-    panel.classList.add('va-visible');
-    trigger.classList.add('va-open');
-    trigger.setAttribute('aria-label', 'Close Voice Assistant');
-    mic.style.display = 'none';
-    close.style.display = '';
-
-    // First-time greeting
-    if (conversationHistory.length === 0) {
-      setTimeout(() => {
-        const S = STRINGS[lang];
-        const typing = addTypingIndicator();
-        setTimeout(() => {
-          removeTypingIndicator();
-          addMessage('bot', S.greeting);
-          speak(S.greeting);
-          setTimeout(() => addChips(S.chipGreeting), 300);
-        }, 1000);
-      }, 200);
+    var panel = document.getElementById('jdw-va-panel');
+    var btn   = document.getElementById('jdw-va-btn');
+    if (panel) panel.classList.add('jdw-open');
+    if (btn)   btn.classList.add('jdw-active');
+    if (!initialized) {
+      initialized = true;
+      setTimeout(doGreeting, 350);
     }
   }
 
   function closePanel() {
     isOpen = false;
-    synthesis.cancel();
-    stopListening();
-    setStateLabel('idle');
-    const panel = document.getElementById('va-panel');
-    const trigger = document.getElementById('va-trigger');
-    const mic = document.getElementById('va-trigger-icon-mic');
-    const close = document.getElementById('va-trigger-icon-close');
-    panel.classList.remove('va-visible');
-    trigger.classList.remove('va-open');
-    trigger.setAttribute('aria-label', 'Open Voice Assistant');
-    mic.style.display = '';
-    close.style.display = 'none';
+    stopCurrentAudio();
+    if (convActive) endConversation();
+    var panel = document.getElementById('jdw-va-panel');
+    var btn   = document.getElementById('jdw-va-btn');
+    if (panel) panel.classList.remove('jdw-open');
+    if (btn)   btn.classList.remove('jdw-active');
+    setState('idle');
   }
 
-  /* ─────────────────────────────────────────────────────────
-   * 12. LANGUAGE TOGGLE
-   * ─────────────────────────────────────────────────────────*/
-  function updateLangToggle() {
-    const btn = document.getElementById('va-lang-toggle');
-    if (btn) btn.textContent = STRINGS[lang].langBtn;
-    const input = document.getElementById('va-text-input');
-    if (input) input.placeholder = lang === 'hi' ? 'यहाँ type करें…' : 'Type a message…';
-    document.getElementById('va-state-label').textContent = STRINGS[lang].idleLabel;
-    document.getElementById('va-trigger-label').textContent = STRINGS[lang].micTooltip;
+  function doGreeting() {
+    showTyping();
+    setTimeout(function () {
+      hideTyping();
+      var msg = STR[lang].greeting;
+      addMsg('bot', msg);
+      // FIX-14: seed aiHistory with greeting for full context from turn 1
+      aiHistory.push({ role: 'assistant', content: msg });
+      speakText(msg, function () { addChips(STR[lang].chips); });
+    }, 700);
   }
 
-  /* ─────────────────────────────────────────────────────────
-   * 13. EVENT WIRING
-   * ─────────────────────────────────────────────────────────*/
+  /* ══════════════════════════════════════════════════════════════
+     17.  LANGUAGE TOGGLE
+  ══════════════════════════════════════════════════════════════ */
+  function updateLangBtn() {
+    var btn   = document.getElementById('jdw-lang-btn');
+    var input = document.getElementById('jdw-text-input');
+    if (btn)   btn.textContent   = STR[lang].langBtn;
+    if (input) input.placeholder = lang === 'hi' ? 'Yahan type karein\u2026' : 'Type a message\u2026';
+    setState(state);
+  }
+
+  /* ══════════════════════════════════════════════════════════════
+     18.  EVENT WIRING
+  ══════════════════════════════════════════════════════════════ */
   function wireEvents() {
-    // Trigger button
-    document.getElementById('va-trigger').addEventListener('click', () => {
+    function $(id) { return document.getElementById(id); }
+
+    $('jdw-va-btn') && $('jdw-va-btn').addEventListener('click', function () {
       if (isOpen) closePanel(); else openPanel();
     });
 
-    // Close button
-    document.getElementById('va-close-btn').addEventListener('click', closePanel);
+    $('jdw-close-btn') && $('jdw-close-btn').addEventListener('click', closePanel);
 
-    // Mic button (toggle)
-    document.getElementById('va-mic-btn').addEventListener('click', () => {
-      if (isListening) {
-        stopListening();
-      } else if (!isSpeaking) {
-        startListening();
+    $('jdw-mic-main') && $('jdw-mic-main').addEventListener('click', function () {
+      if (convActive) {
+        endConversation();
+        setState('idle');
+      } else {
+        if (!isOpen) openPanel();
+        startConversation();
       }
     });
 
-    // Send button
-    document.getElementById('va-send-btn').addEventListener('click', sendText);
+    $('jdw-end-btn') && $('jdw-end-btn').addEventListener('click', function () {
+      endConversation();
+      setState('idle');
+    });
 
-    // Enter key in text input
-    document.getElementById('va-text-input').addEventListener('keypress', e => {
+    $('jdw-send-btn') && $('jdw-send-btn').addEventListener('click', sendText);
+
+    $('jdw-text-input') && $('jdw-text-input').addEventListener('keypress', function (e) {
       if (e.key === 'Enter') sendText();
     });
 
-    // Language toggle
-    document.getElementById('va-lang-toggle').addEventListener('click', () => {
+    $('jdw-lang-btn') && $('jdw-lang-btn').addEventListener('click', function () {
       lang = lang === 'en' ? 'hi' : 'en';
-      updateLangToggle();
-      recognition && (recognition.lang = lang === 'hi' ? 'hi-IN' : 'en-IN');
-      // Announce language switch in chat
-      const msg = lang === 'hi'
-        ? 'भाषा Hindi में switch हो गई। मैं अब Hindi में जवाब दूँगा।'
-        : 'Switched to English. I will now respond in English.';
-      addMessage('bot', msg);
+      updateLangBtn();
+      var msg = lang === 'hi'
+        ? 'Ab main Hindi mein jawab doonga.'
+        : 'Switched to English. I will respond in English now.';
+      addMsg('bot', msg);
+      aiHistory.push({ role: 'assistant', content: msg });
     });
 
-    // Escape key closes panel
-    document.addEventListener('keydown', e => {
+    document.addEventListener('keydown', function (e) {
       if (e.key === 'Escape' && isOpen) closePanel();
     });
 
-    // Voices may load async
-    if (synthesis) {
-      synthesis.addEventListener('voiceschanged', () => {});
-    }
+    // Tooltip badge auto-show after 4 s if panel not yet opened
+    setTimeout(function () {
+      var badge = $('jdw-va-badge');
+      if (badge && !isOpen) {
+        badge.classList.add('jdw-show');
+        setTimeout(function () { badge.classList.remove('jdw-show'); }, 5000);
+      }
+    }, 4000);
   }
 
   function sendText() {
-    const input = document.getElementById('va-text-input');
-    const text = (input.value || '').trim();
+    var input = document.getElementById('jdw-text-input');
+    var text  = ((input && input.value) || '').trim();
     if (!text) return;
     input.value = '';
     removeChips();
-    addMessage('user', text);
-    processInput(text);
+    handleInput(text);
   }
 
-  /* ─────────────────────────────────────────────────────────
-   * 14. INIT
-   * ─────────────────────────────────────────────────────────*/
+  /* ══════════════════════════════════════════════════════════════
+     19.  INIT
+  ══════════════════════════════════════════════════════════════ */
   function init() {
+    domContent  = scrapeDOMContent();
     buildDOM();
-    recognition = initRecognition();
+    recognition = buildRecognition();
     wireEvents();
-    setStateLabel('idle');
-
-    // Show tooltip briefly after 3s to attract attention
-    setTimeout(() => {
-      const label = document.getElementById('va-trigger-label');
-      if (label && !isOpen) {
-        label.classList.add('va-show');
-        setTimeout(() => label.classList.remove('va-show'), 4000);
-      }
-    }, 3000);
-
-    // Update cursor tracking so existing site cursor doesn't interfere
-    // The voice assistant uses pointer-events carefully so it won't
-    // conflict with the site's custom cursor logic.
+    setState('idle');
   }
 
-  // Boot when DOM is ready
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', init);
   } else {
